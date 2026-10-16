@@ -1,4 +1,4 @@
-SkyrimMario - Milestone 5.3 (foliage collision + harvest pacing) (Skyrim LE 1.9.32 + SKSE 1.7.3)
+SkyrimMario - Milestone 5.6 (final pass: cave loop fixed) (Skyrim LE 1.9.32 + SKSE 1.7.3)
 ==========================================================
 Mario (physics from your 32-bit sm64.dll) is drawn inside Skyrim LE and now collides
 with real Skyrim geometry.
@@ -19,6 +19,47 @@ CONTROLS (game window focused)
                 (crouch / ground pound), F = B (punch / dive). Arrow keys still work too.
                 Mouse looks around as usual.
 
+5.6 CHANGES (the real cave bug):
+  * Your last log showed 'player moved ~1800 units in one frame' about 25 times in a row, each respawn ~1795 units further along
+    -Y. My 5.5 respawn created a fresh Mario but left the OLD Mario's position in the state variable, so the follower sent the
+    player to 'new origin + old Mario coordinates'; that looked like a game teleport, which triggered another respawn, and so on
+    until the player was thousands of units out in the void. Fixed: all per-Mario state is reset on spawn, following only starts
+    after the new Mario's first physics tick, game-teleport detection has a 2 s cool-down, and spawning tries lower heights (cave
+    ceilings) before falling back to the flat floor.
+
+5.5 CHANGES (cave bug):
+  * Your log: entering a cave showed Fader/Loading menus; afterwards the plugin kept moving the player to Mario's old OUTDOOR
+    coordinates inside the new INTERIOR cell, which dropped you into an empty void ('flat plane'). Fix: while possessing, the
+    player is kept within a few units of Mario every frame, so a jump of 600+ units in one frame can only be the game moving
+    the player (load door, fast travel, respawn). The plugin now forgets the old follow target and re-spawns Mario at the
+    player's new position, with a fresh SM64 origin and fresh collision (log line: 'player moved N units in one frame').
+    Works in or out of possess mode.
+
+5.4 CHANGES (freezes):
+  * Your log: re-centring worked (10 re-origins, no STUCK). The remaining freezes match the collision harvest, which ran
+    7-9 times per 5 s and cost 15-24 ms each on the game's main thread (a whole frame at 30-60 fps).
+    Cause: for ~10,000 scene objects per harvest it did RTTI string comparisons, a memory-validity probe, and built
+    several name strings per shape BEFORE checking whether the shape was anywhere near Mario.
+    Now: object types are cached per vtable, the cheap distance cull runs first (names are only checked for the few
+    shapes near Mario), per-object memory probes are gone, and the 'Sky' and 'Weather' branches are skipped.
+    Expect the harvest line in the perf block to drop from ~15-24 ms to a few ms.
+  * Baseline note: in the menu windows of your log (no Mario) the game itself ran ~24-43 fps on that capture, so ~30 fps
+    in play is largely the machine/capture; the dips to 16-25 fps were the harvest windows.
+
+5.3 CHANGES:
+  * ROOT CAUSE OF THE 'STUCK' REPORT (from your log): Mario had run ~18,000 Skyrim units from his spawn point, i.e. to SM64
+    coordinates around (-23095, -2321, -11540). SM64's physics only work within about +-8192 units of their origin, so
+    out there it found no floor at all (the 'near:' dump showed a normal road right under him). Fix: when Mario is
+    ~3000 SM64 units from the origin the SM64 world is re-centred on him: collision is harvested around his current
+    Skyrim position with that position as the new origin, then in one frame the origin is swapped, the surfaces are
+    loaded and Mario is moved to the matching spot (mesh/interpolation shifted too, so there is no visual pop).
+    The log prints 're-origin #N' lines. Harvests made with an old origin are discarded.
+  * Merged the Codex/Grok collision edits that were sound: flora/foliage meshes are not solid (name filter), and only
+    walkable faces (normal.z >= 0.65) are non-slippery while steeper faces use the default surface type; plus the
+    gentler harvest cadence (500 units / 8 s).
+  * Your perf block looked healthy: every stage < ~2 ms on average (harvest 15 ms every few seconds on the game's
+    main thread).
+
 5.2 CHANGES:
   * Video 2: ~18 fps average but mostly >=30 fps with 37 stalls over 0.1 s (worst 0.9 s) - the periodic stalls are
     most likely the collision reload (sm64 surface load of ~30k triangles). Harvest radius 1400 -> 1000 and only a
@@ -28,12 +69,6 @@ CONTROLS (game window focused)
   * Stuck detector + debug: if you push the stick for 0.5 s without moving, the log gets 'STUCK?' and a list of
     'near:' lines naming the meshes closest to Mario (shape name, parent, class, distance, normal). F7 does the
     same on demand. Send me those lines and I will filter out the offending meshes (foliage cards, clutter...).
-
-5.3 CHANGES:
-  * Collision harvest now rejects common non-solid foliage names (including MountainFlower) and reports the
-    rejected foliage count. Steep faces use the default material; walkable ground keeps NOT_SLIPPERY.
-  * Full scene harvests now trigger after 500 units of movement or 8 seconds (the loaded radius is 1000),
-    reducing periodic main-thread scene-walk stalls.
 
 5.1 CHANGES (performance):
   * The video showed ~10 fps with stalls up to 0.5 s. Fixes: the overlay now draws only from the last back-buffer

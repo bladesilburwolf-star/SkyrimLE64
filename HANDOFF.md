@@ -1,4 +1,4 @@
-# SkyrimMario - handoff notes (state at milestone 5.2)
+# SkyrimMario - handoff notes (state at milestone 5.6 - final pass)
 
 Skyrim LE 1.9.32.0 + SKSE 1.7.3 plugin. Mario's physics/animation come from a 32-bit libsm64 `sm64.dll`
 (built from the user's libsm64 fork; needs `baserom.us.z64`), both in `<Skyrim>\mario64\`.
@@ -15,9 +15,7 @@ The plugin is header-free: SKSE structs/game addresses are declared by hand (tak
 - `collision.cpp`  SKSE *task* (runs on the game's main thread) walks the WorldRoot scene graph and converts nearby
                    NiTriShape triangles to `SM64Surface`s (Skyrim->SM64: m=((x-ox)/S,(z-oz)/S,-(y-oy)/S), S=0.8).
                    Filters sky/fog/cloud domes (`_CD`, Atmosphere...), water, BSLODTriShape, skinned meshes, hidden nodes,
-                   common non-solid foliage names (Flower/Grass/Plant/etc.), triangles with an edge > 2500 units.
-                   Winding is fixed up using the mesh's own vertex normals. Steep faces use the default material;
-                   walkable ground uses NOT_SLIPPERY.
+                   triangles with an edge > 2500 units. Winding is fixed up using the mesh's own vertex normals.
 - `possess.cpp`    Task: hides every NiGeometry in the player skeleton (flag bit0 at +0x98) and calls
                    `MoveRefrToPosition` (@0x90C9F0) every frame to put the player actor on Mario so the stock 3rd-person
                    camera follows.
@@ -47,8 +45,8 @@ The plugin is header-free: SKSE structs/game addresses are declared by hand (tak
 3. **Not in the 3D scene**: no occlusion, no world lighting, no shadows. Proper fix = create/clone an NiTriShape in the scene
    graph (skse/NiGeometry.h has `NiTriShape::Create`) and refresh its vertex data every frame.
 4. Possession still lets the game receive WASD/Space (teleport overrides it). Could block via the DirectInput wrapper.
-5. Collision is re-harvested after 500 units of movement or 8 s (radius 1000); SM64 collision is limited to about +-8192 SM64 units
-   from the spawn origin - re-origin when Mario travels far.
+5. Collision is re-harvested around Mario (radius 1000, every ~500 units / 8 s). SM64 physics only work within ~+-8192 units of the
+   SM64 origin; overlay.cpp `UpdateCollision/ApplyNewOrigin` re-centres the SM64 world on Mario when he is >3000 units out (5.3).
 6. Mario's own body parts: no animation hooks into Skyrim (sounds/music/audio not wired up; libsm64 audio API is unused).
 
 ## Do NOT
@@ -62,10 +60,28 @@ The plugin is header-free: SKSE structs/game addresses are declared by hand (tak
   PlayerCamera singleton 0x012E7288, cameraNode @+0x1C, camera states array @+0x6C) and offset the camera by (Mario - player),
   leashing the real actor (teleport only when far) so cells/AI still follow.
 
-## 5.2 / 5.3 notes
-- Harvest radius 1000, vertical band -450/+550 around Mario. Common foliage names are excluded after a stuck report
-  identified `MountainFlower02Red` collision at Mario's position. Harvest logs report `foliage=` rejected counts.
-- Full harvest interval is 500 units of movement or 8 seconds. Each harvest still walks the scene graph on the main thread;
-  the supplied log showed roughly 11-18 ms per harvest, but sustained render-side averages were under 1 ms per scene.
+## 5.2 notes
+- All surfaces use type 0x0015 (NOT_SLIPPERY). Harvest radius 1000, vertical band -450/+550 around Mario.
 - F7 / stuck detector -> `CollisionDebugNext()` makes the next harvest log the nearest triangles ('near:' lines).
-- Potential remaining collision offenders: foliage with generic names, tiny clutter, meshes without normals (winding guess).
+- Likely remaining collision offenders: alpha-tested foliage cards, tiny clutter, meshes without normals (winding guess).
+
+## 5.3 notes
+- 'Stuck far from spawn' was SM64's world-bounds limit, not bad collision. Re-origin implemented (see README 5.3).
+- Codex's flora-name filter and slope-type split are merged in collision.cpp.
+
+## 5.4 notes
+- Harvest hot path: `TypeOf()` caches class by vtable; bound cull happens before `RejectShape` (string work); no per-object IsBadReadPtr.
+- Mario runs ~770 Skyrim units/s, so teleporting the player also makes Skyrim stream cells quickly -> engine hitches that this plugin cannot remove.
+  If it matters, scale Mario's speed or limit it.
+
+## 5.5 notes
+- Door/fast-travel handling: overlay.cpp detects a >600-unit one-frame jump of the player (outside menus) -> `PossessClearTarget()` + `Spawn(0)`.
+- Not yet handled: Mario interacting with doors himself (the player can still press the activate key), interiors with lots of non-solid meshes.
+
+## 5.6 notes / where to go next
+- Respawn loop root cause + fix: see README 5.6 (`FinishSpawn` resets g_st/g_prevM/...; follow gated on `g_hadTick`; 2 s resync cool-down).
+- Untested in-game: caves/interiors after 5.6, fast travel. Check the log for 'player moved N units' - it must appear ONCE per door, not repeatedly.
+- IDEA (user): a portal near Riverwood to a native SM64 world. Feasible plan: convert a decomp level (levels/<name>/areas/1/*/collision.inc.c =
+  COL_VERTEX/COL_TRI macros, plus model.inc.c display lists + extracted textures) offline with a script into a mesh + collision file,
+  load collision with sm64_static_surfaces_load, render the mesh with the existing overlay pipeline over a sky-coloured backdrop, and switch
+  modes when Mario steps into a portal activator (return portal restores the Skyrim view). Needs the user's decomp asset tree.

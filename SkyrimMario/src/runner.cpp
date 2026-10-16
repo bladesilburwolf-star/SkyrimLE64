@@ -19,7 +19,7 @@ bool LoadSM64(const std::string& dllPath, SM64Api& api, FILE* log)
     if (!h) { fprintf(log, "ERROR: LoadLibrary failed for %s (Win32 error %lu). 32-bit DLL required.\n", dllPath.c_str(), GetLastError()); return false; }
     bool ok = true;
     LOADFN(register_debug_print_function); LOADFN(global_init); LOADFN(global_terminate);
-    LOADFN(static_surfaces_load); LOADFN(mario_create); LOADFN(mario_tick); LOADFN(mario_delete); LOADFN(surface_find_floor_height); LOADFN(audio_init); LOADFN(audio_tick); LOADFN(set_sound_volume);
+    LOADFN(static_surfaces_load); LOADFN(mario_create); LOADFN(mario_tick); LOADFN(mario_delete); LOADFN(surface_find_floor_height); LOADFN(audio_init); LOADFN(audio_tick); LOADFN(set_sound_volume); LOADFN(set_mario_position);
     return ok;
 }
 

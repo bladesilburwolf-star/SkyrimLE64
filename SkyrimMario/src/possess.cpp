@@ -110,6 +110,8 @@ void PossessSet(bool on) {
     Queue();
 }
 
+void PossessClearTarget() { EnterCriticalSection(&g_cs); g_haveTarget = false; LeaveCriticalSection(&g_cs); }
+
 void PossessFollow(const float p[3]) {
     EnterCriticalSection(&g_cs); bool on = g_on; if (on) { g_target[0] = p[0]; g_target[1] = p[1]; g_target[2] = p[2]; g_haveTarget = true; } LeaveCriticalSection(&g_cs);
     if (on) Queue();

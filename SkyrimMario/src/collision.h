@@ -7,8 +7,10 @@
 void CollisionInit(FILE* log);
 // Ask for a fresh harvest centred on a Skyrim-space point; origin/scale describe the
 // Skyrim->SM64 mapping (sky = origin + S * (mx, -mz, my)).
-void CollisionRequest(const float centerSky[3], float radiusSky, const float originSky[3], float S);
+// Returns false if a previous harvest is still in flight (try again later).
+bool CollisionRequest(const float centerSky[3], float radiusSky, const float originSky[3], float S);
 // If a finished harvest is waiting, moves it into `out` and returns true.
-bool CollisionFetch(std::vector<SM64Surface>& out);
+// originOut = the Skyrim-space origin this harvest was converted with (so stale results can be discarded).
+bool CollisionFetch(std::vector<SM64Surface>& out, float originOut[3]);
 // Debug: the NEXT harvest also logs the triangles closest to the query point (name, parent, normal, distance).
 void CollisionDebugNext();

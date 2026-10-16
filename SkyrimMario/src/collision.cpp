@@ -4,6 +4,7 @@
 #include <math.h>
 #include <string.h>
 #include <string>
+#include <unordered_map>
 
 extern void* g_skseTaskInterface;   // SKSETaskInterface* (set by plugin.cpp)
 struct SKSETaskInterfaceLite { uint32_t interfaceVersion; void (*AddTask)(void* task); void (*AddUITask)(void* task); };
@@ -26,6 +27,7 @@ static const float V_BELOW = 450.0f, V_ABOVE = 550.0f;   // vertical band around
 
 // request parameters (written by render thread, read by main thread under lock)
 static float g_qc[3], g_qr, g_qo[3], g_qS;
+static float g_readyOrigin[3];
 
 // ---- safe memory helpers ----
 static bool Ok(const void* p, size_t n) { return p && !IsBadReadPtr(p, n); }
@@ -67,6 +69,15 @@ static void DumpTree(uintptr_t root, uintptr_t pnode) {
 }
 
 static std::string NodeName(uintptr_t obj);
+// Class tests by walking the RTTI chain with strcmp were the main cost of a harvest (~10k objects). The type only depends on the
+// object's vtable, so cache it: 1 = NiNode (or subclass), 2 = NiTriShape (or subclass), 0 = anything else.
+static std::unordered_map<uintptr_t, int> g_typeCache;
+static int TypeOf(uintptr_t o) {
+    uintptr_t vt = Rd<uintptr_t>(o);
+    auto it = g_typeCache.find(vt); if (it != g_typeCache.end()) return it->second;
+    int t = IsA(o, "NiNode") ? 1 : (IsA(o, "NiTriShape") ? 2 : 0);
+    g_typeCache[vt] = t; return t;
+}
 struct Stats { int nodes, shapes, noData, skinned, noNormals, hidden, tris, culled, rejLOD, rejSky, rejWater, rejFoliage, bigTris; };
 
 
@@ -111,7 +122,6 @@ static const float MAX_EDGE = 2500.0f;   // sky domes / fog / LOD quads have eno
 
 static void ProcessShape(uintptr_t shp, std::vector<SM64Surface>& out, Stats& st) {
     if (Rd<uintptr_t>(shp + 0xB4)) { ++st.skinned; return; }          // skinned (actors): bind pose, skip
-    if (RejectShape(shp, st)) return;
     uintptr_t d = Rd<uintptr_t>(shp + 0xB0); if (!Ok((void*)d, 0x54)) { ++st.noData; return; }
     uint16_t nv = Rd<uint16_t>(d + 0x08), nt = Rd<uint16_t>(d + 0x48);
     const float* V = (const float*)Rd<uintptr_t>(d + 0x20); const float* N = (const float*)Rd<uintptr_t>(d + 0x24);
@@ -125,6 +135,7 @@ static void ProcessShape(uintptr_t shp, std::vector<SM64Surface>& out, Stats& st
     float bc[3] = { sc * (R[0]*B[0] + R[1]*B[1] + R[2]*B[2]) + P[0], sc * (R[3]*B[0] + R[4]*B[1] + R[5]*B[2]) + P[1], sc * (R[6]*B[0] + R[7]*B[1] + R[8]*B[2]) + P[2] };
     float br = B[3] * sc;
     if (br > 0 && (fabsf(bc[0]-g_qc[0]) > g_qr + br || fabsf(bc[1]-g_qc[1]) > g_qr + br || fabsf(bc[2]-g_qc[2]) > g_qr + br)) { ++st.culled; return; }
+    if (RejectShape(shp, st)) return;                  // names/classes are only checked for shapes that are actually near Mario
 
     // transform vertices to Skyrim world space
     static std::vector<float> W; W.resize(nv * 3);
@@ -207,15 +218,19 @@ static void Harvest(std::vector<SM64Surface>& out, Stats& st) {
     int guard = 0;
     while (!stack.empty() && ++guard < 200000 && out.size() < 80000) {
         E e = stack.back(); stack.pop_back(); uintptr_t o = e.o;
-        if (!o || o == pnode || !Ok((void*)o, 0xB8)) continue;
+        if (o < 0x10000 || (o & 3) || o == pnode) continue;
         if (Rd<uint32_t>(o + 0x98) & 1) { ++st.hidden; continue; }                 // app-culled / hidden
-        if (e.depth == 2) { e.br = (int)brs.size(); brs.push_back({ NodeName(o), ClassName(o), 0 }); }   // child of ShadowSceneNode
-        if (IsA(o, "NiNode")) {
+        if (e.depth == 2) {                                                         // child of ShadowSceneNode
+            std::string bn = NodeName(o); e.br = (int)brs.size(); brs.push_back({ bn, ClassName(o), 0 });
+            if (bn == "Sky" || bn == "Weather") continue;                           // never ground; skips hundreds of sky shapes
+        }
+        int ty = TypeOf(o);
+        if (ty == 1) {
             ++st.nodes;
             uintptr_t data = Rd<uintptr_t>(o + 0xAC); uint16_t cnt = Rd<uint16_t>(o + 0xB2);
-            if (!data || cnt > 8192 || !Ok((void*)data, cnt * 4)) continue;
+            if (!data || (data & 3) || cnt > 8192) continue;
             for (int i = 0; i < cnt; ++i) { uintptr_t ch = ((uintptr_t*)data)[i]; if (ch) stack.push_back({ ch, e.depth + 1, e.br }); }
-        } else if (IsA(o, "NiTriShape")) {
+        } else if (ty == 2) {
             size_t before = out.size(); ProcessShape(o, out, st);
             if (e.br >= 0) brs[e.br].tris += (int)(out.size() - before);
         }
@@ -234,7 +249,7 @@ public:
         g_colLogged = 0; ++g_colHarvests;
         if (g_colHarvests <= 3) LOG("column dump for harvest %d at Skyrim (%.0f, %.0f) feet z=%.0f:", g_colHarvests, g_qc[0], g_qc[1], g_qo[2]);
         Harvest(tmp, st);
-        EnterCriticalSection(&g_cs); g_ready.swap(tmp); g_haveReady = true; LeaveCriticalSection(&g_cs);
+        EnterCriticalSection(&g_cs); g_ready.swap(tmp); memcpy(g_readyOrigin, g_qo, sizeof g_readyOrigin); g_haveReady = true; LeaveCriticalSection(&g_cs);
         if (g_harvestsLogged < 8) { ++g_harvestsLogged;
             LOG("harvest: %d tris | nodes=%d shapes=%d (noData=%d skinned=%d noNormals=%d) hidden=%d culled=%d rejected: LOD=%d sky=%d water=%d foliage=%d bigTris=%d | %lu ms",
                 st.tris, st.nodes, st.shapes, st.noData, st.skinned, st.noNormals, st.hidden, st.culled, st.rejLOD, st.rejSky, st.rejWater, st.rejFoliage, st.bigTris, GetTickCount() - t0); }
@@ -247,15 +262,16 @@ void CollisionDebugNext() { InterlockedExchange(&g_debugNext, 1); }
 
 void CollisionInit(FILE* log) { g_log = log; if (!g_csInit) { InitializeCriticalSection(&g_cs); g_csInit = true; } }
 
-void CollisionRequest(const float c[3], float r, const float o[3], float S) {
-    if (!g_skseTaskInterface || InterlockedCompareExchange(&g_taskPending, 1, 0) != 0) return;
+bool CollisionRequest(const float c[3], float r, const float o[3], float S) {
+    if (!g_skseTaskInterface || InterlockedCompareExchange(&g_taskPending, 1, 0) != 0) return false;
     EnterCriticalSection(&g_cs);
     memcpy(g_qc, c, 12); g_qr = r; memcpy(g_qo, o, 12); g_qS = S;
     LeaveCriticalSection(&g_cs);
     ((SKSETaskInterfaceLite*)g_skseTaskInterface)->AddTask(new HarvestTask());
+    return true;
 }
 
-bool CollisionFetch(std::vector<SM64Surface>& out) {
-    EnterCriticalSection(&g_cs); bool have = g_haveReady; if (have) { out.swap(g_ready); g_ready.clear(); g_haveReady = false; } LeaveCriticalSection(&g_cs);
+bool CollisionFetch(std::vector<SM64Surface>& out, float originOut[3]) {
+    EnterCriticalSection(&g_cs); bool have = g_haveReady; if (have) { out.swap(g_ready); g_ready.clear(); memcpy(originOut, g_readyOrigin, 12); g_haveReady = false; } LeaveCriticalSection(&g_cs);
     return have;
 }

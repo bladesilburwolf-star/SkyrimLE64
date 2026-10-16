@@ -27,6 +27,7 @@ struct SM64Api {
     void    (*audio_init)(const uint8_t* rom);
     uint32_t (*audio_tick)(uint32_t numQueued, uint32_t numDesired, int16_t* buffer);
     void    (*set_sound_volume)(float vol);
+    void    (*set_mario_position)(int32_t marioId, float x, float y, float z);
 };
 
 bool LoadSM64(const std::string& dllPath, SM64Api& api, FILE* log);

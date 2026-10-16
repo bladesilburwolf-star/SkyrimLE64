@@ -57,6 +57,8 @@ static bool g_spawnPending = false;
 static int g_diagTicks = 0;
 static bool g_possess = false, g_f8 = false, g_f7 = false;
 static float g_stuckRef[3]; static int g_stuckTicks = 0, g_stuckEvents = 0;
+static bool g_reoriginPending = false, g_reoriginRequested = false; static float g_pendingOrigin[3]; static int g_reorigins = 0;
+static float g_lastHarvestC[3] = { 0, 0, 0 }; static uint64_t g_lastSurfHash = 0;
 // render-time interpolation between the last two 30 Hz physics ticks (removes stepping / camera shake)
 static float g_renderDelta[3] = { 0, 0, 0 };   // possess mode: shift Mario onto the player actor so he sits exactly where the camera looks
 static std::vector<float> g_prevPos, g_posI;
@@ -117,41 +119,80 @@ static const DWORD FVF = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1;
 static bool Focused() { DWORD pid = 0; GetWindowThreadProcessId(GetForegroundWindow(), &pid); return pid == GetCurrentProcessId(); }
 static bool Key(int vk) { return Focused() && (GetAsyncKeyState(vk) & 0x8000); }
 
-static void Spawn() {
+static void Spawn(float forward = 150.0f) {
     float pp[3], hd; if (!GetPlayer(pp, &hd)) { LOG("spawn: player not available"); return; }
-    g_origin[0] = pp[0] + sinf(hd) * 150.0f; g_origin[1] = pp[1] + cosf(hd) * 150.0f; g_origin[2] = pp[2];
+    g_origin[0] = pp[0] + sinf(hd) * forward; g_origin[1] = pp[1] + cosf(hd) * forward; g_origin[2] = pp[2];
     if (g_mario >= 0) { { SM64Lock lk; g_api.mario_delete(g_mario); } g_mario = -1; }
+    g_reoriginPending = false; g_reoriginRequested = false; g_lastSurfHash = 0; g_lastHarvestC[0] = g_lastHarvestC[1] = g_lastHarvestC[2] = 0;
     g_diagTicks = 0; g_spawnPending = true; QueryPerformanceCounter(&g_spawnTime); g_lastHarvest.QuadPart = 0;
     LOG("Spawn requested at Skyrim (%.0f, %.0f, %.0f) - waiting for collision harvest", g_origin[0], g_origin[1], g_origin[2]);
 }
 static void Despawn() { if (g_possess) { g_possess = false; PossessSet(false); InputBlockSet(false); XInputBlockSet(false); } if (g_mario >= 0) { SM64Lock lk; g_api.mario_delete(g_mario); } g_mario = -1; g_spawnPending = false; LOG("Mario removed"); }
 static void FinishSpawn() {
-    { SM64Lock lk; g_mario = g_api.mario_create(0, 125, 0); }                    // ~100 Skyrim units above the player's feet
-    if (g_mario < 0) { LOG("mario_create failed with real collision; using flat floor"); LoadFlatFloor(); { SM64Lock lk; g_mario = g_api.mario_create(0, 50, 0); } }
+    float spawnY = 125.f;
+    { SM64Lock lk; g_mario = g_api.mario_create(0, spawnY, 0); }                  // ~100 Skyrim units above the player's feet
+    if (g_mario < 0) { spawnY = 40.f; SM64Lock lk; g_mario = g_api.mario_create(0, spawnY, 0); }   // low ceilings (caves)
+    if (g_mario < 0) { LOG("mario_create failed with real collision; using flat floor"); spawnY = 50.f; LoadFlatFloor(); { SM64Lock lk; g_mario = g_api.mario_create(0, spawnY, 0); } }
+    // Reset every piece of per-Mario state: a stale position from the previous Mario made the follower throw the player ~1800
+    // units away, which looked like a game teleport and re-spawned Mario in a runaway loop (cave bug).
+    memset(&g_st, 0, sizeof g_st); g_st.position[1] = spawnY; memcpy(g_prevM, g_st.position, sizeof g_prevM); g_prevTris = 0; g_gb.numTrianglesUsed = 0;
+    g_renderDelta[0] = g_renderDelta[1] = g_renderDelta[2] = 0; g_stuckTicks = 0;
     g_spawnPending = false; g_accum = 0; QueryPerformanceCounter(&g_last); g_loggedFrames = 0; g_hadTick = false;
     LOG("Mario spawned id=%d", g_mario);
 }
 // Every 0.5 s: queue a harvest around Mario, and load any finished harvest into sm64.dll.
+// SM64's physics only work within about +-8192 units of the SM64 origin. When Mario has travelled ~3000 units from it we
+// re-centre the whole SM64 world on him: harvest collision around his current Skyrim position using that position as the
+// new origin, then (atomically, in one frame) swap the origin, load the new surfaces and move Mario to the matching spot.
+static bool SameOrigin(const float* a, const float* b) { return fabsf(a[0]-b[0]) < 0.5f && fabsf(a[1]-b[1]) < 0.5f && fabsf(a[2]-b[2]) < 0.5f; }
+static uint64_t HashSurfaces(const std::vector<SM64Surface>& v) {
+    uint64_t h = 1469598103934665603ULL; const uint8_t* b = (const uint8_t*)v.data(); size_t nb = v.size() * sizeof(SM64Surface);
+    for (size_t i = 0; i < nb; ++i) { h ^= b[i]; h *= 1099511628211ULL; } return h;
+}
+static void ApplyNewOrigin(const LARGE_INTEGER& now) {
+    float skyNow[3]; ToSky(g_st.position, skyNow);                 // Mario's Skyrim position under the OLD origin
+    float oldM[3] = { g_st.position[0], g_st.position[1], g_st.position[2] };
+    memcpy(g_origin, g_pendingOrigin, sizeof g_origin);
+    float m[3] = { (skyNow[0] - g_origin[0]) / S, (skyNow[2] - g_origin[2]) / S, -(skyNow[1] - g_origin[1]) / S };   // inverse of ToSky
+    { ProfScope ps(P_SURFLOAD); SM64Lock lk; g_api.static_surfaces_load(g_surf.data(), (uint32_t)g_surf.size()); g_api.set_mario_position(g_mario, m[0], m[1], m[2]); }
+    float dm[3] = { m[0] - oldM[0], m[1] - oldM[1], m[2] - oldM[2] };
+    memcpy(g_st.position, m, sizeof m); for (int i = 0; i < 3; ++i) g_prevM[i] += dm[i];
+    for (int t = 0; t < g_gb.numTrianglesUsed * 3; ++t) for (int k = 0; k < 3; ++k) g_pos[t*3 + k] += dm[k];      // keep this frame's mesh consistent
+    for (int t = 0; t < g_prevTris * 3; ++t) for (int k = 0; k < 3; ++k) g_prevPos[t*3 + k] += dm[k];
+    g_stuckTicks = 0; g_lastSurfHash = HashSurfaces(g_surf); g_lastHarvest = now; memcpy(g_lastHarvestC, skyNow, sizeof skyNow);
+    g_reoriginPending = false; g_reoriginRequested = false; ++g_reorigins;
+    if (g_reorigins <= 10) LOG("re-origin #%d: SM64 world re-centred on Mario at Skyrim (%.0f, %.0f, %.0f); %d surfaces", g_reorigins, g_origin[0], g_origin[1], g_origin[2], (int)g_surf.size());
+}
 static void UpdateCollision() {
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    {
+    if (g_mario >= 0 && !g_reoriginPending) {
+        const float L = 3000.f;
+        if (fabsf(g_st.position[0]) > L || fabsf(g_st.position[1]) > L || fabsf(g_st.position[2]) > L) { ToSky(g_st.position, g_pendingOrigin); g_reoriginPending = true; g_reoriginRequested = false; }
+    }
+    if (g_reoriginPending) {
+        if (!g_reoriginRequested) g_reoriginRequested = CollisionRequest(g_pendingOrigin, HARVEST_RADIUS, g_pendingOrigin, S);   // retried until accepted
+    } else {
         float c[3]; if (g_mario >= 0) ToSky(g_st.position, c); else { c[0] = g_origin[0]; c[1] = g_origin[1]; c[2] = g_origin[2]; }
-        static float s_lastC[3]; float dx = c[0]-s_lastC[0], dy = c[1]-s_lastC[1], dz = c[2]-s_lastC[2];
+        float dx = c[0]-g_lastHarvestC[0], dy = c[1]-g_lastHarvestC[1], dz = c[2]-g_lastHarvestC[2];
         double since = g_lastHarvest.QuadPart ? double(now.QuadPart - g_lastHarvest.QuadPart) / g_freq.QuadPart : 1e9;
         // The harvest covers a 1000-unit radius. Keep a generous movement margin
         // while avoiding a full scene walk every few seconds in stationary play.
         if (g_lastHarvest.QuadPart == 0 || dx*dx + dy*dy + dz*dz > 500.f * 500.f || since > 8.0) {
-            CollisionRequest(c, HARVEST_RADIUS, g_origin, S); g_lastHarvest = now; s_lastC[0] = c[0]; s_lastC[1] = c[1]; s_lastC[2] = c[2];
+            if (CollisionRequest(c, HARVEST_RADIUS, g_origin, S)) { g_lastHarvest = now; memcpy(g_lastHarvestC, c, sizeof c); }
         }
     }
-    if (CollisionFetch(g_surf)) {
-        if (!g_surf.empty()) {
-            uint64_t h = 1469598103934665603ULL; const uint8_t* b = (const uint8_t*)g_surf.data(); size_t nb = g_surf.size() * sizeof(SM64Surface);
-            for (size_t i = 0; i < nb; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
-            static uint64_t s_lastHash = 0;
-            if (h != s_lastHash) { s_lastHash = h; ProfScope ps(P_SURFLOAD); SM64Lock lk; g_api.static_surfaces_load(g_surf.data(), (uint32_t)g_surf.size()); }
-            if (g_spawnPending) FinishSpawn(); }
-        else if (g_spawnPending && double(now.QuadPart - g_spawnTime.QuadPart) / g_freq.QuadPart > 3.0) { LOG("no collision found nearby; using flat floor"); LoadFlatFloor(); FinishSpawn(); }
+    float ro[3];
+    if (CollisionFetch(g_surf, ro)) {
+        if (g_reoriginPending && SameOrigin(ro, g_pendingOrigin)) {
+            if (!g_surf.empty() && g_mario >= 0) ApplyNewOrigin(now);
+            else { g_reoriginPending = false; g_reoriginRequested = false; LOG("re-origin: no collision around Mario, keeping the old origin"); }
+        } else if (SameOrigin(ro, g_origin)) {
+            if (!g_surf.empty()) {
+                uint64_t h = HashSurfaces(g_surf);
+                if (h != g_lastSurfHash) { g_lastSurfHash = h; ProfScope ps(P_SURFLOAD); SM64Lock lk; g_api.static_surfaces_load(g_surf.data(), (uint32_t)g_surf.size()); }
+                if (g_spawnPending) FinishSpawn();
+            } else if (g_spawnPending && double(now.QuadPart - g_spawnTime.QuadPart) / g_freq.QuadPart > 3.0) { LOG("no collision found nearby; using flat floor"); LoadFlatFloor(); FinishSpawn(); }
+        }   // else: a harvest made with a different (stale) origin - discard it
     }
     if (g_spawnPending && double(now.QuadPart - g_spawnTime.QuadPart) / g_freq.QuadPart > 8.0) { LOG("collision harvest never returned; using flat floor"); LoadFlatFloor(); FinishSpawn(); }
 }
@@ -327,6 +368,25 @@ static void OverlayFrame(IDirect3DDevice9* dev) {
     if (!g_builtThisFrame) {                 // once per frame: input, physics tick, projection
         g_builtThisFrame = true; g_haveGeom = false; g_drawCount = 0;
         g_menuOpen = CheckMenuOpen();
+        // The game itself moved the player (load door, fast travel, respawn): Mario's world no longer exists there. While possessing, we keep
+        // the player within a few units of Mario every frame, so a jump of hundreds of units can only come from the game. Re-spawn Mario
+        // at the player's new position instead of dragging the player back to the old place (which dropped it into the void in a cave).
+        if (!g_menuOpen) {
+            static float s_prevPlayer[3]; static bool s_havePrev = false; float pp[3], hd;
+            if (GetPlayer(pp, &hd)) {
+                if (s_havePrev && (g_mario >= 0 || g_spawnPending)) {
+                    float dx = pp[0]-s_prevPlayer[0], dy = pp[1]-s_prevPlayer[1], dz = pp[2]-s_prevPlayer[2];
+                    static LARGE_INTEGER s_lastResync = {}; LARGE_INTEGER nowQ; QueryPerformanceCounter(&nowQ);
+                    double sinceResync = s_lastResync.QuadPart ? double(nowQ.QuadPart - s_lastResync.QuadPart) / g_freq.QuadPart : 1e9;
+                    if (dx*dx + dy*dy + dz*dz > 600.f * 600.f && sinceResync > 2.0) {
+                        s_lastResync = nowQ;
+                        LOG("player moved %.0f units in one frame (load door / fast travel): re-spawning Mario at the player's new position", sqrtf(dx*dx + dy*dy + dz*dz));
+                        PossessClearTarget(); Spawn(0.0f);
+                    }
+                }
+                memcpy(s_prevPlayer, pp, sizeof pp); s_havePrev = true;
+            }
+        }
         InputBlockSet(g_possess && !g_menuOpen); XInputBlockSet(g_possess && !g_menuOpen);       // hide Mario's keys from the game while possessing
         bool f9 = !g_menuOpen && Key(VK_F9), f10 = !g_menuOpen && Key(VK_F10);
         if (f9 && !g_f9) { if (g_mario >= 0) Despawn(); else Spawn(); }
@@ -352,7 +412,7 @@ static void OverlayFrame(IDirect3DDevice9* dev) {
                     if (dx*dx + dy*dy + dz*dz < 150.f * 150.f) { g_renderDelta[0] = dx; g_renderDelta[1] = dy; g_renderDelta[2] = dz; } }
             }
             { ProfScope ps(P_BUILD); BuildGeom(ci, (float)d.Width, (float)d.Height); }
-            if (g_possess) PossessFollow(ms);
+            if (g_possess && g_hadTick) PossessFollow(ms);
         }
         AudioSetActive(g_mario >= 0 && !g_menuOpen);
     }

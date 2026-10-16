@@ -29,7 +29,7 @@ static DWORD WINAPI Worker(LPVOID) {
     std::string gameDir = ModuleDir(nullptr);
     FILE* log = fopen((pluginDir + "\\SkyrimMario.log").c_str(), "w");
     if (!log) return 1;
-    fprintf(log, "SkyrimMario milestone 2 (plugin dir: %s)\n", pluginDir.c_str());
+    fprintf(log, "SkyrimMario milestone 5.3 (plugin dir: %s)\n", pluginDir.c_str());
     fprintf(log, "Looking for sm64.dll + baserom.us.z64 in: %s\\mario64\n", gameDir.c_str());
     OverlayRun(gameDir + "\\mario64", log);
     return 0; // log stays open for the overlay

@@ -5,4 +5,5 @@
 // own third-person camera follows Mario. Runs as a SKSE task on the game's main thread.
 void PossessInit(FILE* log);
 void PossessSet(bool on);                          // on: hide body + follow; off: show body again
+void PossessClearTarget();                         // forget the follow target (e.g. after a door / fast travel)
 void PossessFollow(const float posSky[3]);        // call once per frame with Mario's Skyrim position
