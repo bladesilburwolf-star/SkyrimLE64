@@ -1,2 +1,3 @@
 # SkyrimLE64
 Create a directory in your Skyrim Legendary Edition directory wherever that is. Name it mario64 and put your baserom.us.z64 Super Mario 64 (U) file in that directory. Put sm64.dll also in the same directory. You will need the classic Skyrim Script Extender and put the compiled script in your Data/SKSE plugins directory.  
+The mod will have to remain incomplete for now and someone else will need to fork it and complete it. I am getting too frustrated with the overcrowded scene and getting cut off before projects even really begin. So we will leave this as it is for now until someone else finishes it. 
